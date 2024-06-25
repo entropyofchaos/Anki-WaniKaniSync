@@ -33,11 +33,12 @@ class WKImporter(NoteImporter):
         "Audio", "Keisei"
     ]
 
-    def __init__(self, collection, model, subjects, sub_subjects, study_mats):
+    def __init__(self, collection, model, deck_name, subjects, sub_subjects, study_mats):
         NoteImporter.__init__(self, collection, None)
         self.allowHTML = True
         self.importMode = UPDATE_MODE
         self.model = model
+        self.deck_name = deck_name
         self.subjects = subjects
         self.sub_subjects = sub_subjects
         self.study_mats = study_mats
@@ -61,7 +62,7 @@ class WKImporter(NoteImporter):
         raise ImportCancelledException("The import was cancelled.")
 
     def fields(self):
-        return len(self.FIELDS) + 1 # Final unnamed field is the _tags one
+        return len(self.col.models.field_names(self.model)) + 1 # Final unnamed field is the _tags one
 
     def load_pitch_data(self):
         pitchfile = pathlib.Path(__file__).parent.resolve() / "pitch" / "accent_data.csv.xz"
@@ -143,49 +144,75 @@ class WKImporter(NoteImporter):
 
         note = ForeignNote()
 
-        note.fields = [
-            subject["id"],
-            self.get_sort_id(subject),
-            f'<a href="{data["document_url"]}">{self.get_character(subject)}</a>',
-            subject["object"].replace("_", " ").title(),
-            ", ".join(data["parts_of_speech"]) if "parts_of_speech" in data else "",
+        # Create a dictionary mapping field names to their values
+        new_field_values = {
+            "card_id": subject["id"],
+            "sort_id": self.get_sort_id(subject),
+            "Characters": f'<a href="{data["document_url"]}">{self.get_character(subject)}</a>',
+            "Card_Type": subject["object"].replace("_", " ").title(),
+            "Word_Type": ", ".join(data["parts_of_speech"]) if "parts_of_speech" in data else "",
 
-            ", ".join(meanings),
-            self.html_newlines(((data.get("meaning_mnemonic", "") or "") + meaning_note).strip()),
-            self.html_newlines(data.get("meaning_hint", "") or ""),
-            ", ".join(meanings_whl + meanings + meaning_synonyms),
+            "Meaning": ", ".join(meanings),
+            "Meaning_Mnemonic": self.html_newlines(((data.get("meaning_mnemonic", "") or "") + meaning_note).strip()),
+            "Meaning_Hint": self.html_newlines(data.get("meaning_hint", "") or ""),
+            "Meaning_Whitelist": ", ".join(meanings_whl + meanings + meaning_synonyms),
 
-            ", ".join(readings.get("primary", [])),
-            ", ".join(readings.get("onyomi", [])),
-            ", ".join(readings.get("kunyomi", [])),
-            ", ".join(readings.get("nanori", [])),
-            ", ".join(readings.get("accepted", [])),
-            self.html_newlines(((data.get("reading_mnemonic", "") or "") + reading_note).strip()),
-            self.html_newlines(data.get("reading_hint", "") or ""),
+            "Reading": ", ".join(readings.get("primary", [])),
+            "Reading_Onyomi": ", ".join(readings.get("onyomi", [])),
+            "Reading_Kunyomi": ", ".join(readings.get("kunyomi", [])),
+            "Reading_Nanori": ", ".join(readings.get("nanori", [])),
+            "Reading_Whitelist": ", ".join(readings.get("accepted", [])),
+            "Reading_Mnemonic": self.html_newlines(((data.get("reading_mnemonic", "") or "") + reading_note).strip()),
+            "Reading_Hint": self.html_newlines(data.get("reading_hint", "") or ""),
 
-            "、 ".join(comp_chars),
-            "、 ".join(comp_mean),
-            "、 ".join(comp_read),
+            "Components_Characters": "、 ".join(comp_chars),
+            "Components_Meaning": "、 ".join(comp_mean),
+            "Components_Reading": "、 ".join(comp_read),
 
-            "、 ".join(simi_chars),
-            "、 ".join(simi_mean),
-            "、 ".join(simi_read),
+            "Similar_Characters": "、 ".join(simi_chars),
+            "Similar_Meaning": "、 ".join(simi_mean),
+            "Similar_Reading": "、 ".join(simi_read),
 
-            "、 ".join(amal_chars),
-            "、 ".join(amal_mean),
-            "、 ".join(amal_read),
+            "Found_in_Characters": "、 ".join(amal_chars),
+            "Found_in_Meaning": "、 ".join(amal_mean),
+            "Found_in_Reading": "、 ".join(amal_read),
 
-            self.get_context_patterns(subject),
-            self.get_context_sentences(subject),
+            "Context_Patterns": self.get_context_patterns(subject),
+            "Context_Sentences": self.get_context_sentences(subject),
 
-            self.ensure_audio(subject),
+            "Audio": self.ensure_audio(subject),
 
-            self.get_keisei(subject),
+            "Keisei": self.get_keisei(subject),
 
-            "Lesson_" + str(data["level"]) + " " + subject["object"].title()
-        ]
+            "_tags": "Lesson_" + str(data["level"]) + " " + subject["object"].title()
+        }
 
-        note.fields = [str(f) for f in note.fields]
+        # Retrieve existing note values if the note exists
+        existing_note = None
+        note_id = subject["id"]
+
+        # Search for existing note by card_id
+        search_query = f'card_id:{note_id} deck:"{self.deck_name}"'
+        existing_note_ids = self.col.find_notes(search_query)
+        if existing_note_ids:
+            existing_note = self.col.get_note(existing_note_ids[0])
+
+        # Construct the note fields list, merging existing and new values
+        existing_card_fields = self.col.models.field_names(self.model)
+        for field in existing_card_fields:
+            if field in new_field_values and new_field_values[field] != "":
+                # Update a field if updated data has been retrieved
+                note.fields.append(str(new_field_values[field]))
+            elif existing_note:
+                # Try copying existing note's field if there is no update
+                note.fields.append(str(existing_note[field]))
+            else:
+                # Fill in field as empty if new data is empty and existing
+                # note doesn't exist.
+                note.fields.append(str(""))
+
+        # Add the tags field last manually
+        note.fields.append(str(new_field_values["_tags"])) 
 
         return note
 
@@ -587,16 +614,17 @@ def ensure_deck(col, note_name, deck_name):
         field_names = col.models.field_names(model)
 
         # Add missing fields at the end. Most notably, the Keisei one.
-        while len(field_names) < len(WKImporter.FIELDS):
-            col.models.add_field(model, col.models.new_field(WKImporter.FIELDS[len(field_names)]))
-            field_names = col.models.field_names(model)
-            ret = True
+        for field in WKImporter.FIELDS:
+            if field not in field_names:
+                col.models.add_field(model, col.models.new_field(field))
+                field_names = col.models.field_names(model)
+                ret = True
 
         if ret:
             col.models.update_dict(model)
             model = col.models.by_name(note_name)
 
-        if field_names != WKImporter.FIELDS:
+        if all(field in field_names for field in WKImporter.FIELDS) == False:
             raise Exception("Existing WaniKani deck does not match expected field layout!")
 
     deck_id = col.decks.id(deck_name, create=False)
@@ -694,7 +722,7 @@ def ensure_notes(col, subjects, sub_subjects, study_mats, note_name, deck_name):
 
     col.set_aux_notetype_config(model["id"], "lastDeck", deck_id)
 
-    importer = WKImporter(col, model, subjects, sub_subjects, study_mats)
+    importer = WKImporter(col, model, deck_name, subjects, sub_subjects, study_mats)
     importer.initMapping()
     importer.run()
 
